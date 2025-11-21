@@ -1,6 +1,7 @@
 ﻿using SeminarClassesAssistant.BOT.Models;
 using System.Collections.Concurrent;
-using System.Text.Json;
+using SeminarClassesAssistant.BOT.FileServices;
+using SeminarClassesAssistant.BOT.QuestionServices;
 using Telegram.Bot;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
@@ -10,24 +11,32 @@ using Telegram.Bot.Types.ReplyMarkups;
 const string ACCESS_PASSWORD = "seminar2025";
 const string QUESTIONS_FILE = "questions.json";
 const string QUEUE_FILE = "queue.json";
-ClearQueueFile();
+FileCleaner.ClearFile(QUEUE_FILE);
 
 ConcurrentDictionary<long, UserSession> users = new();
 Dictionary<ChatId, string> userQuestions = new();
 Dictionary<ChatId, int> userQuestionMessageIds = new();
 
-List<string> questions = LoadQuestions();
+List<string> questions = QuestionsReader.ReadQuestionsFromFile(questionsFile: QUESTIONS_FILE);
 
-TelegramBotClient botClient = new("8484504732:AAE3x1wnixzzBqWN0Xg6RU6lHUQRVVEMBng");
+TelegramBotClient botClient = new(token: "8484504732:AAE3x1wnixzzBqWN0Xg6RU6lHUQRVVEMBng");
 
 // Запуск прийому оновлень
-botClient.StartReceiving(Update, Error);
+try
+{
+    botClient.StartReceiving(Update, Error);
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Exception: {ex}. Втрачено з‘єднання");
+}
+
 Console.ReadLine();
 
 // ===========================================================
 // ГОЛОВНИЙ ОБРОБНИК UPDATE
 // ===========================================================
-async Task Update(ITelegramBotClient botClient, Update update, CancellationToken token)
+async Task Update(ITelegramBotClient сlient, Update update, CancellationToken token)
 {
     // 🔹 Обробка повідомлень (Message)
     if (update.Message is { } message && message.Text is { } messageText)
@@ -86,7 +95,8 @@ async Task Update(ITelegramBotClient botClient, Update update, CancellationToken
                 replyMarkup: removeKeyboard
             );
 
-            await ShowOptions(botClient, userId);
+            var messageId = await QuestionPresenter.ShowQuestions(botClient, userId, questions);
+            userQuestionMessageIds[userId] = messageId;
             return;
         }
 
@@ -99,7 +109,8 @@ async Task Update(ITelegramBotClient botClient, Update update, CancellationToken
 
         if (messageText == "/showquestions")
         {
-            await ShowOptions(botClient, userId);
+            var messageId = await QuestionPresenter.ShowQuestions(botClient, userId, questions);
+            userQuestionMessageIds[userId] = messageId;
             return;
         }
 
@@ -117,10 +128,35 @@ async Task Update(ITelegramBotClient botClient, Update update, CancellationToken
             }
             return;
         }
+        
+        // При скасуванні питання
+        if (messageText == "/cancelmyquestion")
+        {
+            if (!userQuestions.ContainsKey(userId))
+            {
+                await botClient.SendMessage(userId, "Ви не обирали жодного питання.");
+                return;
+            }
+
+            string canceledQuestion = userQuestions[userId];
+    
+            userQuestions.Remove(userId);
+            questions.Add(canceledQuestion);
+            questions = QuestionSorter.Sort(questions);
+    
+            // Тепер не потрібно передавати users
+            await UserQueueRemover.RemoveUserFromQueue(userId, QUEUE_FILE);
+    
+            await botClient.SendMessage(userId, $"❌ Ви скасували питання:\n{canceledQuestion}\n\nТепер воно знову доступне для інших.");
+    
+            await QuestionsUpdater.UpdateAllQuestionsInUsers(botClient, userQuestionMessageIds, questions);
+    
+            return;
+        }
 
         if (messageText == "/showqueue")
         {
-            await ShowQuestionsUsersQueue(botClient, userId);
+            await QuestionsWithUsersQueuePresenter.ShowQuestionsWithUsersQueue(botClient, userId, QUEUE_FILE);
             return;
         }
     }
@@ -164,16 +200,22 @@ async Task Update(ITelegramBotClient botClient, Update update, CancellationToken
             // Закріпити питання за користувачем
             userQuestions[user.Id] = selectedQuestion;
 
-            await AddUserWithQuestionToJSON(user.Username!, selectedQuestion);
-
+            // Передаємо userId, username і question
+            await UsersWithQuestionsWriter.AddUserWithQuestionToJSON(
+                user.Id, 
+                user.Username ?? string.Empty, 
+                selectedQuestion, 
+                QUEUE_FILE
+            );
+            
             // Видалити питання зі списку
             questions.RemoveAt(index);
 
             // Повідомити користувача
             await botClient.AnswerCallbackQuery(callbackQuery.Id, $"✅ Ви обрали: {selectedQuestion}");
 
-            // 🔥 ОНОВИТИ СПИСОК У ВСІХ КОРИСТУВАЧІВ
-            await UpdateAllUsersQuestionLists(botClient);
+            // ОНОВИТИ СПИСОК У ВСІХ КОРИСТУВАЧІВ
+            await QuestionsUpdater.UpdateAllQuestionsInUsers(botClient, userQuestionMessageIds, questions);
         }
     }
 }
@@ -185,237 +227,4 @@ Task Error(ITelegramBotClient client, Exception exception, HandleErrorSource sou
 {
     Console.WriteLine($"Помилка: {exception.Message}");
     return Task.CompletedTask;
-}
-
-// ===========================================================
-// ВИВЕДЕННЯ ПИТАНЬ
-// ===========================================================
-async Task ShowOptions(ITelegramBotClient client, ChatId chatId)
-{
-    if (questions.Count == 0)
-    {
-        await client.SendMessage(chatId, "Немає доступних питань 😕");
-        return;
-    }
-
-    var inlineKeyboard = new InlineKeyboardMarkup(
-        questions.Select((q, index) =>
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData(q, $"question_{index}")
-            })
-    );
-
-    var sentMessage = await client.SendMessage(
-        chatId: chatId,
-        text: "🧾 Оберіть питання для семінару:",
-        replyMarkup: inlineKeyboard
-    );
-
-    // Зберігаємо messageId для подальшого оновлення
-    userQuestionMessageIds[chatId] = sentMessage.MessageId;
-}
-
-// ===========================================================
-// ВИВЕДЕННЯ ВСІХ ПИТАНЬ ТА КОРИСТУВАЧІВ, ЯКІ ЇХ ОБРАЛИ
-// ===========================================================
-async Task ShowQuestionsUsersQueue(ITelegramBotClient client, ChatId chatId)
-{
-    try
-    {
-        if (!File.Exists(QUEUE_FILE))
-        {
-            await client.SendMessage(
-                chatId: chatId,
-                text: "⚠️ Ще ніхто не обрав запитання!");
-            return;
-        }
-
-        string existingContent = await File.ReadAllTextAsync(QUEUE_FILE);
-        var queue = JsonSerializer.Deserialize<List<UserInQueue>>(existingContent);
-
-        if (queue == null || queue.Count == 0)
-        {
-            await client.SendMessage(
-                chatId: chatId,
-                text: "Ще ніхто не обрав запитання!");
-            return;
-        }
-
-        // Сортуємо по номеру питання
-        queue.Sort();
-
-        // Формуємо текст повідомлення
-        var messageText = "📋 *Черга виступів:*\n\n";
-
-        foreach (var user in queue)
-        {
-            messageText += $"🔹 Питання {user.QuestionNumber}\n";
-            messageText += $"   {user.Question}\n";
-            messageText += $"   👤 @{user.Username}\n";
-            messageText += $"   🕐 {user.SelectedAt:dd.MM.yyyy HH:mm}\n\n";
-        }
-
-        await client.SendMessage(
-            chatId: chatId,
-            text: messageText);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Помилка завантаження списку: {ex.Message}");
-        await client.SendMessage(
-            chatId: chatId,
-            text: "Помилка при завантаженні черги 😕");
-    }
-}
-
-
-// ===========================================================
-// ОНОВЛЕННЯ СПИСКУ У ВСІХ КОРИСТУВАЧІВ
-// ===========================================================
-async Task UpdateAllUsersQuestionLists(ITelegramBotClient client)
-{
-    // Проходимо по всіх користувачах, які мають збережене повідомлення зі списком
-    foreach (var kvp in userQuestionMessageIds.ToList())
-    {
-        ChatId chatId = kvp.Key;
-        int messageId = kvp.Value;
-
-        try
-        {
-            if (questions.Count == 0)
-            {
-                await client.EditMessageText(
-                    chatId: chatId,
-                    messageId: messageId,
-                    text: "✅ Усі питання вже розібрано!"
-                );
-                // Видаляємо з словника, бо більше не треба оновлювати
-                userQuestionMessageIds.Remove(chatId);
-            }
-            else
-            {
-                var inlineKeyboard = new InlineKeyboardMarkup(
-                    questions.Select((q, index) =>
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData(q, $"question_{index}")
-                        })
-                );
-
-                await client.EditMessageText(
-                    chatId: chatId,
-                    messageId: messageId,
-                    text: "🧾 Оберіть питання для семінару:",
-                    replyMarkup: inlineKeyboard
-                );
-            }
-        }
-        catch (Exception ex)
-        {
-            // Якщо повідомлення видалено або недоступне
-            Console.WriteLine($"Не вдалося оновити список для користувача {chatId}: {ex.Message}");
-            userQuestionMessageIds.Remove(chatId);
-        }
-    }
-}
-
-// ===========================================================
-// ЗАВАНТАЖЕННЯ ПИТАНЬ З JSON
-// ===========================================================
-List<string> LoadQuestions()
-{
-    try
-    {
-        if (!File.Exists(QUESTIONS_FILE))
-        {
-            Console.WriteLine($"Файл {QUESTIONS_FILE} не знайдено.");
-            return new List<string>();
-        }
-
-        string jsonContent = File.ReadAllText(QUESTIONS_FILE);
-        var loadedQuestions = JsonSerializer.Deserialize<List<string>>(jsonContent);
-
-        Console.WriteLine($"Завантажено {loadedQuestions?.Count ?? 0} питань з {QUESTIONS_FILE}");
-        return loadedQuestions ?? new List<string>();
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Помилка завантаження питань: {ex.Message}");
-        return new List<string>();
-    }
-}
-
-// ===========================================================
-// ДОДАВАННЯ КОРИСТУВАЧА ДО ЧЕРГИ У JSON
-// ===========================================================
-async Task AddUserWithQuestionToJSON(string username, string question)
-{
-    try
-    {
-        // Читаємо існуючу чергу
-        List<UserInQueue> queue = new();
-
-        if (File.Exists(QUEUE_FILE))
-        {
-            string existingContent = await File.ReadAllTextAsync(QUEUE_FILE);
-            queue = JsonSerializer.Deserialize<List<UserInQueue>>(existingContent) ?? new();
-        }
-
-        // Витягуємо номер питання
-        int questionNumber = 0;
-        var match = System.Text.RegularExpressions.Regex.Match(question, @"^(\d+)\.");
-        if (match.Success)
-        {
-            questionNumber = int.Parse(match.Groups[1].Value);
-        }
-
-        // Додаємо нового користувача
-        queue.Add(new UserInQueue
-        {
-            Username = username,
-            Question = question,
-            QuestionNumber = questionNumber,
-            SelectedAt = DateTime.Now
-        });
-        queue.Sort();
-
-        // Зберігаємо оновлену чергу
-        var options = new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-        };
-
-        string jsonContent = JsonSerializer.Serialize(queue, options);
-        await File.WriteAllTextAsync(QUEUE_FILE, jsonContent);
-
-        Console.WriteLine($"Користувача {username} додано до черги ({QUEUE_FILE})");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Помилка додавання до черги: {ex.Message}");
-    }
-}
-
-// ===========================================================
-// ОЧИЩЕННЯ ФАЙЛУ ЧЕРГИ ПРИ ЗАПУСКУ
-// ===========================================================
-void ClearQueueFile()
-{
-    try
-    {
-        if (File.Exists(QUEUE_FILE))
-        {
-            File.Delete(QUEUE_FILE);
-            Console.WriteLine($"Файл {QUEUE_FILE} видалено");
-        }
-
-        // Створюємо порожній масив JSON
-        Console.WriteLine($"Файл {QUEUE_FILE} створено порожнім");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Помилка очищення файлу черги: {ex.Message}");
-    }
 }
