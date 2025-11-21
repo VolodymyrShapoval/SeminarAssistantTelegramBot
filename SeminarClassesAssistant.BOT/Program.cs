@@ -31,7 +31,7 @@ catch (Exception ex)
     Console.WriteLine($"Exception: {ex}. Втрачено з‘єднання");
 }
 
-Console.ReadLine();
+await Task.Delay(-1);
 
 // ===========================================================
 // ГОЛОВНИЙ ОБРОБНИК UPDATE
